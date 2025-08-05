@@ -4,10 +4,36 @@ import subprocess
 import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from pydub import AudioSegment
-from pydub.utils import mediainfo
 import threading
 import time
+import warnings
+
+# Configure FFmpeg paths before importing pydub
+if getattr(sys, 'frozen', False):
+    # If running as compiled executable
+    application_path = os.path.dirname(sys.executable)
+    ffmpeg_path = os.path.join(application_path, 'ffmpeg', 'ffmpeg.exe')
+    ffprobe_path = os.path.join(application_path, 'ffmpeg', 'ffprobe.exe')
+else:
+    # If running as Python script
+    application_path = os.path.dirname(os.path.abspath(__file__))
+    ffmpeg_path = os.path.join(application_path, 'ffmpeg', 'ffmpeg.exe')
+    ffprobe_path = os.path.join(application_path, 'ffmpeg', 'ffprobe.exe')
+
+# Suppress FFmpeg warnings from pydub
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    from pydub import AudioSegment
+    from pydub.utils import mediainfo
+    
+# Set FFmpeg paths for pydub
+AudioSegment.converter = ffmpeg_path
+AudioSegment.ffmpeg = ffmpeg_path
+AudioSegment.ffprobe = ffprobe_path
+
+# Also set the paths in pydub.utils which mediainfo uses
+from pydub import utils
+utils.which = lambda x: ffmpeg_path if x == "ffmpeg" else ffprobe_path if x == "ffprobe" else None
 
 # Constants
 duration_limit = 14 * 60  # 14 minutes in seconds
@@ -63,6 +89,11 @@ class AudioSplitterApp:
         file_path = filedialog.askopenfilename(filetypes=[
             ("Audio Files", "*.mp3;*.wav;*.flac;*.ogg;*.m4a")])
         if file_path:
+            # Check if file exists
+            if not os.path.exists(file_path):
+                messagebox.showerror("Error", f"File not found: {file_path}")
+                return
+                
             def run_splitting():
                 try:
                     max_duration = int(self.duration_var.get()) * 60
@@ -70,20 +101,48 @@ class AudioSplitterApp:
                     split_audio_file(file_path, max_duration, self.progress)
                     messagebox.showinfo("Success", "Splitting complete!")
                     os.startfile(os.path.join(os.path.dirname(file_path), os.path.splitext(os.path.basename(file_path))[0] + "_splits"))
+                except subprocess.CalledProcessError as e:
+                    error_msg = f"FFmpeg error: {e}\n"
+                    if e.stderr:
+                        error_msg += f"Error output: {e.stderr.decode('utf-8', errors='ignore')}"
+                    messagebox.showerror("Error", error_msg)
                 except Exception as e:
-                    messagebox.showerror("Error", str(e))
+                    import traceback
+                    error_msg = f"Error: {str(e)}\n\nFull traceback:\n{traceback.format_exc()}"
+                    messagebox.showerror("Error", error_msg)
 
             threading.Thread(target=run_splitting).start()
 
 # Main logic
 def split_audio_file(file_path, duration_limit, progress=None):
+    print(f"Starting to split file: {file_path}")
+    print(f"FFmpeg path: {ffmpeg_path}")
+    print(f"FFprobe path: {ffprobe_path}")
+    
+    # Check if FFmpeg executables exist
+    if not os.path.exists(ffmpeg_path):
+        raise FileNotFoundError(f"FFmpeg not found at: {ffmpeg_path}")
+    if not os.path.exists(ffprobe_path):
+        raise FileNotFoundError(f"FFprobe not found at: {ffprobe_path}")
+    
     file_name, file_ext = os.path.splitext(os.path.basename(file_path))
     output_dir = os.path.join(os.path.dirname(file_path), file_name + "_splits")
     os.makedirs(output_dir, exist_ok=True)
     
     # Get audio duration
-    info = mediainfo(file_path)
-    duration = float(info['duration'])
+    print(f"Getting media info for: {file_path}")
+    try:
+        info = mediainfo(file_path)
+        duration = float(info['duration'])
+        print(f"Duration: {duration} seconds")
+    except Exception as e:
+        print(f"Error getting media info: {e}")
+        # Try alternative method using ffprobe directly
+        ffprobe_args = [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+        result = subprocess.run(ffprobe_args, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"FFprobe failed: {result.stderr}")
+        duration = float(result.stdout.strip())
 
     # Calculate segments
     num_segments = math.ceil(duration / duration_limit)
@@ -95,7 +154,7 @@ def split_audio_file(file_path, duration_limit, progress=None):
         output_file = os.path.join(output_dir, f"{file_name}_{i+1:03d}{file_ext}")
 
         ffmpeg_args = [
-            'ffmpeg', '-y', '-i', file_path,
+            ffmpeg_path, '-y', '-i', file_path,
             '-ss', str(start), '-to', str(end),
             '-c', 'copy', '-copyts', output_file
         ]
